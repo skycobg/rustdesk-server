@@ -593,7 +593,10 @@ impl RendezvousServer {
         };
         {
             let p = peer.read().await;
-            if p.uuid != rk.uuid || p.info.ip != ip {
+            // The UDP registration keeps the address as the socket gives it ("::ffff:a.b.c.d" on a dual-stack
+            // socket), the TCP side here as plain IPv4.
+            let same_ip = p.info.ip.strip_prefix("::ffff:").unwrap_or(&p.info.ip) == ip.as_str();
+            if p.uuid != rk.uuid || !same_ip {
                 log::warn!(
                     "change_id {} -> {} from {} refused: uuid {}, last ip {}",
                     rk.old_id,
