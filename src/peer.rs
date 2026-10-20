@@ -132,32 +132,72 @@ impl PeerMap {
         register_pk_response::Result::OK
     }
 
-    /// SKY: rename a peer to `id`: the same row (guid), uuid and public key; see `RendezvousServer::change_id`.
-    pub(crate) async fn change_id(&self, old_id: &str, id: &str) -> register_pk_response::Result {
-        let peer = match self.map.read().await.get(old_id).cloned() {
-            Some(peer) => peer,
-            None => return register_pk_response::Result::UUID_MISMATCH,
-        };
-        let (guid, pk, info_str) = {
+    /// SKY: rename the peer `old_id` (already checked by `RendezvousServer::change_id`) to `id`: the same row
+    /// (guid), uuid and public key. Done under the map's write lock, so the check that `id` is free and the
+    /// rename are one step (the unique index on `id` guards the database too). `old_id` stays reserved for the
+    /// same device by a row with its uuid and key: nobody else can register it, and the device may go back.
+    pub(crate) async fn change_id(
+        &self,
+        old_id: &str,
+        id: &str,
+        peer: LockPeer,
+    ) -> register_pk_response::Result {
+        use register_pk_response::Result::{ID_EXISTS, OK, SERVER_ERROR, UUID_MISMATCH};
+        let (guid, uuid, pk, info_str) = {
             let p = peer.read().await;
             (
                 p.guid.clone(),
+                p.uuid.clone(),
                 p.pk.clone(),
                 serde_json::to_string(&p.info).unwrap_or_default(),
             )
         };
-        if guid.is_empty() {
-            return register_pk_response::Result::UUID_MISMATCH;
-        }
-        // The unique index on `id` refuses an ID that is taken in the database.
-        if let Err(err) = self.db.update_pk(&guid, id, &pk, &info_str).await {
-            log::error!("db.update_pk (change_id {} -> {}) failed: {}", old_id, id, err);
-            return register_pk_response::Result::SERVER_ERROR;
+        if guid.is_empty() || uuid.is_empty() {
+            return UUID_MISMATCH;
         }
         let mut map = self.map.write().await;
+        match map.get(old_id) {
+            Some(p) if Arc::ptr_eq(p, &peer) => {}
+            _ => return UUID_MISMATCH,
+        }
+        // `id` is free if nobody has it, or it is this device's own reservation.
+        let mut own_reservation = None;
+        if let Some(other) = map.get(id) {
+            let o = other.read().await;
+            if !o.uuid.is_empty() && o.uuid != uuid {
+                return ID_EXISTS;
+            }
+        }
+        match self.db.get_peer(id).await {
+            Ok(Some(row)) => {
+                if row.uuid != uuid.to_vec() {
+                    return ID_EXISTS;
+                }
+                own_reservation = Some(row.guid);
+            }
+            Ok(None) => {}
+            Err(err) => {
+                log::error!("db.get_peer (change_id {} -> {}) failed: {}", old_id, id, err);
+                return SERVER_ERROR;
+            }
+        }
+        if let Some(res_guid) = own_reservation {
+            if let Err(err) = self.db.delete_peer(&res_guid).await {
+                log::error!("db.delete_peer (change_id {} -> {}) failed: {}", old_id, id, err);
+                return SERVER_ERROR;
+            }
+        }
+        if let Err(err) = self.db.update_pk(&guid, id, &pk, &info_str).await {
+            log::error!("db.update_pk (change_id {} -> {}) failed: {}", old_id, id, err);
+            return SERVER_ERROR;
+        }
+        if let Err(err) = self.db.insert_peer(old_id, &uuid, &pk, &info_str).await {
+            // The rename is done; only the reservation of the old ID is missing.
+            log::error!("db.insert_peer (reserve {} after change_id) failed: {}", old_id, err);
+        }
         map.remove(old_id);
         map.insert(id.to_owned(), peer);
-        register_pk_response::Result::OK
+        OK
     }
 
     #[inline]

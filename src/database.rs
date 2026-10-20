@@ -124,6 +124,15 @@ impl Database {
         Ok(guid)
     }
 
+    /// SKY: drop a row by guid (a device's own reservation of an ID it moves back to).
+    pub async fn delete_peer(&self, guid: &[u8]) -> ResultType<()> {
+        sqlx::query("delete from peer where guid = ?")
+            .bind(guid)
+            .execute(self.pool.get().await?.deref_mut())
+            .await?;
+        Ok(())
+    }
+
     pub async fn update_pk(
         &self,
         guid: &Vec<u8>,

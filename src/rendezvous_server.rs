@@ -548,7 +548,7 @@ impl RendezvousServer {
                 Some(rendezvous_message::Union::RegisterPk(rk)) => {
                     // SKY: the client's "Change ID" (and `--set-id`) sends RegisterPk{old_id, id, uuid}
                     // over TCP; upstream OSS answered NOT_SUPPORT to every TCP RegisterPk.
-                    let res = self.change_id(rk, addr).await;
+                    let res = self.change_id(rk, addr, ws).await;
                     let mut msg_out = RendezvousMessage::new();
                     msg_out.set_register_pk_response(RegisterPkResponse {
                         result: res.into(),
@@ -562,13 +562,20 @@ impl RendezvousServer {
         false
     }
 
-    /// SKY: change a peer's ID (`old_id` -> `id`), keeping its guid, uuid and public key; the old ID becomes
-    /// free. Only with the uuid stored for `old_id`, and only to a valid ID that nobody has (in memory or in
-    /// the database). The client then registers with the new ID over UDP as usual.
-    async fn change_id(&mut self, rk: RegisterPk, addr: SocketAddr) -> register_pk_response::Result {
-        use register_pk_response::Result::{ID_EXISTS, INVALID_ID_FORMAT, NOT_SUPPORT, OK};
+    /// SKY: change a peer's ID (`old_id` -> `id`), keeping its database row, uuid and public key. Proof of
+    /// ownership: the uuid stored for `old_id` AND the public IP of its last registration (so only a client on
+    /// the device's own network can ask); never over WebSocket, where the IP may come from a header. The old
+    /// ID stays reserved for the same device (see `PeerMap::change_id`). The client then registers with the
+    /// new ID over UDP as usual.
+    async fn change_id(
+        &mut self,
+        rk: RegisterPk,
+        addr: SocketAddr,
+        ws: bool,
+    ) -> register_pk_response::Result {
+        use register_pk_response::Result::{INVALID_ID_FORMAT, NOT_SUPPORT, OK};
         let ip = try_into_v4(addr).ip().to_string();
-        if rk.old_id.is_empty() || rk.uuid.is_empty() {
+        if ws || rk.old_id.is_empty() || rk.uuid.is_empty() {
             return NOT_SUPPORT;
         }
         if rk.old_id == rk.id {
@@ -584,17 +591,21 @@ impl RendezvousServer {
             Some(peer) => peer,
             None => return UUID_MISMATCH,
         };
-        if peer.read().await.uuid != rk.uuid {
-            log::warn!("change_id {} -> {} from {}: uuid mismatch", rk.old_id, rk.id, ip);
-            return UUID_MISMATCH;
-        }
-        if let Some(other) = self.pm.get(&rk.id).await {
-            // An entry without uuid is only a placeholder of a never registered ID.
-            if !other.read().await.uuid.is_empty() {
-                return ID_EXISTS;
+        {
+            let p = peer.read().await;
+            if p.uuid != rk.uuid || p.info.ip != ip {
+                log::warn!(
+                    "change_id {} -> {} from {} refused: uuid {}, last ip {}",
+                    rk.old_id,
+                    rk.id,
+                    ip,
+                    if p.uuid == rk.uuid { "ok" } else { "mismatch" },
+                    p.info.ip
+                );
+                return UUID_MISMATCH;
             }
         }
-        let res = self.pm.change_id(&rk.old_id, &rk.id).await;
+        let res = self.pm.change_id(&rk.old_id, &rk.id, peer).await;
         log::info!("change_id {} -> {} from {}: {:?}", rk.old_id, rk.id, ip, res);
         res
     }
