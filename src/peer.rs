@@ -132,6 +132,34 @@ impl PeerMap {
         register_pk_response::Result::OK
     }
 
+    /// SKY: rename a peer to `id`: the same row (guid), uuid and public key; see `RendezvousServer::change_id`.
+    pub(crate) async fn change_id(&self, old_id: &str, id: &str) -> register_pk_response::Result {
+        let peer = match self.map.read().await.get(old_id).cloned() {
+            Some(peer) => peer,
+            None => return register_pk_response::Result::UUID_MISMATCH,
+        };
+        let (guid, pk, info_str) = {
+            let p = peer.read().await;
+            (
+                p.guid.clone(),
+                p.pk.clone(),
+                serde_json::to_string(&p.info).unwrap_or_default(),
+            )
+        };
+        if guid.is_empty() {
+            return register_pk_response::Result::UUID_MISMATCH;
+        }
+        // The unique index on `id` refuses an ID that is taken in the database.
+        if let Err(err) = self.db.update_pk(&guid, id, &pk, &info_str).await {
+            log::error!("db.update_pk (change_id {} -> {}) failed: {}", old_id, id, err);
+            return register_pk_response::Result::SERVER_ERROR;
+        }
+        let mut map = self.map.write().await;
+        map.remove(old_id);
+        map.insert(id.to_owned(), peer);
+        register_pk_response::Result::OK
+    }
+
     #[inline]
     pub(crate) async fn get(&self, id: &str) -> Option<LockPeer> {
         let p = self.map.read().await.get(id).cloned();

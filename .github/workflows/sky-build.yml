@@ -1,0 +1,41 @@
+# SKY: builds hbbs (with our ID change) for the SKY Support server (x86_64 Linux, static musl like upstream).
+# The server .151 runs the upstream .deb packages; only /usr/bin/hbbs is replaced by this build.
+name: SKY hbbs build
+
+on:
+  workflow_dispatch:
+  push:
+    tags:
+      - "sky-*"
+
+jobs:
+  linux-musl:
+    runs-on: ubuntu-24.04
+    steps:
+      - name: Checkout source code
+        uses: actions/checkout@v4
+        with:
+          submodules: recursive
+
+      - name: Install Rust (same version as upstream build.yaml)
+        uses: dtolnay/rust-toolchain@master
+        with:
+          toolchain: "1.90"
+          targets: x86_64-unknown-linux-musl
+
+      - name: Install cross
+        run: |
+          curl -sSL https://github.com/cross-rs/cross/releases/download/v0.2.5/cross-x86_64-unknown-linux-gnu.tar.gz | tar xz -C ~/.cargo/bin
+          cross --version
+
+      - name: Build hbbs
+        run: |
+          cross build --release --target x86_64-unknown-linux-musl --bin hbbs
+          file target/x86_64-unknown-linux-musl/release/hbbs
+          sha256sum target/x86_64-unknown-linux-musl/release/hbbs
+
+      - name: Upload hbbs
+        uses: actions/upload-artifact@v4
+        with:
+          name: hbbs-x86_64-linux-musl
+          path: target/x86_64-unknown-linux-musl/release/hbbs

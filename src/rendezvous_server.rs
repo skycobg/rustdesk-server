@@ -545,8 +545,10 @@ impl RendezvousServer {
                     msg_out.set_test_nat_response(res);
                     Self::send_to_sink(sink, msg_out).await;
                 }
-                Some(rendezvous_message::Union::RegisterPk(_)) => {
-                    let res = register_pk_response::Result::NOT_SUPPORT;
+                Some(rendezvous_message::Union::RegisterPk(rk)) => {
+                    // SKY: the client's "Change ID" (and `--set-id`) sends RegisterPk{old_id, id, uuid}
+                    // over TCP; upstream OSS answered NOT_SUPPORT to every TCP RegisterPk.
+                    let res = self.change_id(rk, addr).await;
                     let mut msg_out = RendezvousMessage::new();
                     msg_out.set_register_pk_response(RegisterPkResponse {
                         result: res.into(),
@@ -558,6 +560,43 @@ impl RendezvousServer {
             }
         }
         false
+    }
+
+    /// SKY: change a peer's ID (`old_id` -> `id`), keeping its guid, uuid and public key; the old ID becomes
+    /// free. Only with the uuid stored for `old_id`, and only to a valid ID that nobody has (in memory or in
+    /// the database). The client then registers with the new ID over UDP as usual.
+    async fn change_id(&mut self, rk: RegisterPk, addr: SocketAddr) -> register_pk_response::Result {
+        use register_pk_response::Result::{ID_EXISTS, INVALID_ID_FORMAT, NOT_SUPPORT, OK};
+        let ip = try_into_v4(addr).ip().to_string();
+        if rk.old_id.is_empty() || rk.uuid.is_empty() {
+            return NOT_SUPPORT;
+        }
+        if rk.old_id == rk.id {
+            return OK;
+        }
+        if !hbb_common::is_valid_custom_id(&rk.id) {
+            return INVALID_ID_FORMAT;
+        }
+        if !self.check_ip_blocker(&ip, &rk.id).await {
+            return TOO_FREQUENT;
+        }
+        let peer = match self.pm.get(&rk.old_id).await {
+            Some(peer) => peer,
+            None => return UUID_MISMATCH,
+        };
+        if peer.read().await.uuid != rk.uuid {
+            log::warn!("change_id {} -> {} from {}: uuid mismatch", rk.old_id, rk.id, ip);
+            return UUID_MISMATCH;
+        }
+        if let Some(other) = self.pm.get(&rk.id).await {
+            // An entry without uuid is only a placeholder of a never registered ID.
+            if !other.read().await.uuid.is_empty() {
+                return ID_EXISTS;
+            }
+        }
+        let res = self.pm.change_id(&rk.old_id, &rk.id).await;
+        log::info!("change_id {} -> {} from {}: {:?}", rk.old_id, rk.id, ip, res);
+        res
     }
 
     #[inline]
