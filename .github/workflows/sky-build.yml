@@ -1,4 +1,4 @@
-# SKY: builds hbbs (with our ID change) for the SKY Support server (x86_64 Linux, static musl like upstream).
+# SKY: builds hbbs (with our ID change) for the SKY Support server (x86_64 Linux, static musl like upstream). (SKY)
 # The server .151 runs the upstream .deb packages; only /usr/bin/hbbs is replaced by this build.
 name: SKY hbbs build
 
