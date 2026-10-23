@@ -11,7 +11,8 @@ This is the ID/rendezvous server of **SKY Support**, the remote-support client o
   "Change ID" and `--set-id` send `RegisterPk{old_id, id, uuid}` over TCP; upstream OSS answers `NOT_SUPPORT`.
   We rename the peer (same database row, uuid and public key) when the request carries the uuid stored for
   `old_id`, comes from the public IP of its last registration and not over WebSocket, and the new ID is valid
-  (`^[a-zA-Z][\w-]{5,15}$`) and free; otherwise `UUID_MISMATCH`, `NOT_SUPPORT`, `INVALID_ID_FORMAT`,
+  (6 to 16 of a-z, A-Z, 0-9, `-` and `_` in any order, so only digits or only letters too; upstream asks for a
+  letter first: `is_valid_sky_id`) and free; otherwise `UUID_MISMATCH`, `NOT_SUPPORT`, `INVALID_ID_FORMAT`,
   `ID_EXISTS` or `TOO_FREQUENT`. The old ID stays reserved for the same device.
 - Build: `.github/workflows/sky-build.yml` (hbbs, x86_64 Linux, static musl).
 

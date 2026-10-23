@@ -581,7 +581,7 @@ impl RendezvousServer {
         if rk.old_id == rk.id {
             return OK;
         }
-        if !hbb_common::is_valid_custom_id(&rk.id) {
+        if !is_valid_sky_id(&rk.id) {
             return INVALID_ID_FORMAT;
         }
         if !self.check_ip_blocker(&ip, &rk.id).await {
@@ -1413,4 +1413,12 @@ async fn create_tcp_listener(port: i32) -> ResultType<TcpListener> {
     let s = listen_any(port as _).await?;
     log::debug!("listen on tcp {:?}", s.local_addr());
     Ok(s)
+}
+
+/// SKY: the IDs a peer may change to: 6 to 16 of a-z, A-Z, 0-9, '-' and '_' in any order, so only digits or
+/// only letters too (upstream asks for a letter first). Our client (github.com/skycobg/hbb_common,
+/// `is_valid_custom_id`) checks the same before it asks.
+fn is_valid_sky_id(id: &str) -> bool {
+    (6..=16).contains(&id.len())
+        && id.bytes().all(|b| b.is_ascii_alphanumeric() || b == b'-' || b == b'_')
 }
