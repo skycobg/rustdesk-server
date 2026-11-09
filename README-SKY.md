@@ -14,6 +14,12 @@ This is the ID/rendezvous server of **SKY Support**, the remote-support client o
   (6 to 16 of a-z, A-Z, 0-9, `-` and `_` in any order, so only digits or only letters too; upstream asks for a
   letter first: `is_valid_sky_id`) and free; otherwise `UUID_MISMATCH`, `NOT_SUPPORT`, `INVALID_ID_FORMAT`,
   `ID_EXISTS` or `TOO_FREQUENT`. The old ID stays reserved for the same device.
+- **Key exchange on TCP** (`src/rendezvous_server.rs` `handle_listener_inner`, `send_to_sink`): like the Pro
+  server, hbbs sends a `KeyExchange` with an ephemeral box key signed by the server key as the first message
+  of every TCP connection on 21116. A client that is signed in to an API server waits for it and otherwise fails
+  with "Failed to secure tcp: deadline has elapsed". When the client answers, both directions are sealed with
+  the exchanged key (version 0: one key, counters as nonces); clients that do not answer stay in the clear and
+  skip the message. Same scheme as lejianwen/rustdesk-server.
 - Build: `.github/workflows/sky-build.yml` (hbbs, x86_64 Linux, static musl).
 
 No keys, passwords or addresses of SKY are in this repository.

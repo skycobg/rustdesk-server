@@ -16,7 +16,7 @@ use hbb_common::{
         register_pk_response::Result::{TOO_FREQUENT, UUID_MISMATCH},
         *,
     },
-    tcp::{listen_any, FramedStream},
+    tcp::{listen_any, Encrypt, FramedStream},
     timeout,
     tokio::{
         self,
@@ -31,7 +31,7 @@ use hbb_common::{
     AddrMangle, ResultType,
 };
 use ipnetwork::Ipv4Network;
-use sodiumoxide::crypto::sign;
+use sodiumoxide::crypto::{box_, sign};
 use std::{
     collections::HashMap,
     net::{IpAddr, Ipv4Addr, Ipv6Addr, SocketAddr},
@@ -51,7 +51,9 @@ const REG_TIMEOUT: i64 = 30_000;
 type TcpStreamSink = SplitSink<Framed<TcpStream, BytesCodec>, Bytes>;
 type WsSink = SplitSink<tokio_tungstenite::WebSocketStream<TcpStream>, tungstenite::Message>;
 enum Sink {
-    TcpStream(TcpStreamSink),
+    // SKY: the sending half of the key exchange (see handle_listener_inner); None until the
+    // client answers our KeyExchange, then every frame to it is sealed.
+    TcpStream(TcpStreamSink, Option<Encrypt>),
     Ws(WsSink),
 }
 type Sender = mpsc::UnboundedSender<Data>;
@@ -876,7 +878,11 @@ impl RendezvousServer {
         if let Some(sink) = sink.as_mut() {
             if let Ok(bytes) = msg.write_to_bytes() {
                 match sink {
-                    Sink::TcpStream(s) => {
+                    Sink::TcpStream(s, enc) => {
+                        let bytes = match enc.as_mut() {
+                            Some(enc) => enc.enc(&bytes),
+                            None => bytes,
+                        };
                         allow_err!(s.send(Bytes::from(bytes)).await);
                     }
                     Sink::Ws(ws) => {
@@ -1231,8 +1237,57 @@ impl RendezvousServer {
             }
         } else {
             let (a, mut b) = Framed::new(stream, BytesCodec::new()).split();
-            sink = Some(Sink::TcpStream(a));
-            while let Ok(Some(Ok(bytes))) = timeout(30_000, b.next()).await {
+            sink = Some(Sink::TcpStream(a, None));
+            // SKY: key exchange, as the Pro server does it. A client that is signed in (it has
+            // an access token) waits for this before it sends anything and fails with "Failed to
+            // secure tcp: deadline has elapsed" without it. Clients that do not wait skip it.
+            // Our signed ephemeral box key goes out first; the client answers with its own
+            // ephemeral key and a sealed secretbox key, and from then on both directions are
+            // sealed under that key (version 0: one key, counters as nonces).
+            let mut dec: Option<Encrypt> = None;
+            let mut kx_sk: Option<box_::SecretKey> = None;
+            if let Some(sk) = self.inner.sk.as_ref() {
+                let (our_pk_b, our_sk_b) = box_::gen_keypair();
+                let mut msg_out = RendezvousMessage::new();
+                msg_out.set_key_exchange(KeyExchange {
+                    keys: vec![Bytes::from(sign::sign(&our_pk_b.0, sk))],
+                    ..Default::default()
+                });
+                Self::send_to_sink(&mut sink, msg_out).await;
+                kx_sk = Some(our_sk_b);
+            }
+            while let Ok(Some(Ok(mut bytes))) = timeout(30_000, b.next()).await {
+                if let Some(d) = dec.as_mut() {
+                    if let Err(err) = d.dec(&mut bytes) {
+                        log::debug!("Tcp from {:?}: {}", addr, err);
+                        break;
+                    }
+                } else if let Some(our_sk_b) = kx_sk.take() {
+                    if let Ok(RendezvousMessage {
+                        union: Some(rendezvous_message::Union::KeyExchange(ex)),
+                        ..
+                    }) = RendezvousMessage::parse_from_bytes(&bytes)
+                    {
+                        if ex.keys.len() != 2 {
+                            log::debug!("Tcp from {:?}: bad key exchange", addr);
+                            break;
+                        }
+                        match Encrypt::decode(&ex.keys[1], &ex.keys[0], &our_sk_b) {
+                            Ok(k) => {
+                                if let Some(Sink::TcpStream(_, enc)) = sink.as_mut() {
+                                    *enc = Some(Encrypt::new(k.clone()));
+                                }
+                                dec = Some(Encrypt::new(k));
+                                continue;
+                            }
+                            Err(err) => {
+                                log::debug!("Tcp from {:?}: {}", addr, err);
+                                break;
+                            }
+                        }
+                    }
+                    // Anything else first: a client that does not do the exchange.
+                }
                 if !self.handle_tcp(&bytes, &mut sink, addr, key, ws).await {
                     break;
                 }
