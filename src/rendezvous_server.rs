@@ -31,7 +31,7 @@ use hbb_common::{
     AddrMangle, ResultType,
 };
 use ipnetwork::Ipv4Network;
-use sodiumoxide::crypto::{box_, sign};
+use sodiumoxide::crypto::{box_, generichash, secretbox, sign};
 use std::{
     collections::HashMap,
     net::{IpAddr, Ipv4Addr, Ipv6Addr, SocketAddr},
@@ -39,6 +39,40 @@ use std::{
     sync::Arc,
     time::Instant,
 };
+
+// SKY: TCP key exchange version 1, as in the RustDesk 1.5.1 client (hbb_common tcp.rs): the
+// exchanged key is split into one key per direction, with the transcript mixed in.
+const KX_VERSION: u32 = 1;
+const KX_VERSION_FIELD: u32 = 2;
+const KX_SPLIT_CONTEXT: &[u8] = b"rdkx-spl";
+const KX_SPLIT_INITIATOR: u8 = 1;
+const KX_SPLIT_RESPONDER: u8 = 2;
+
+/// `t` = (initiator's ephemeral pk, responder's ephemeral pk); advertised = picked = 1.
+fn kx_subkey(key: &secretbox::Key, direction: u8, t: (&[u8], &[u8])) -> ResultType<secretbox::Key> {
+    if t.0.len() != box_::PUBLICKEYBYTES || t.1.len() != box_::PUBLICKEYBYTES {
+        bail!("key exchange transcript has a public key of the wrong length");
+    }
+    let mut h = generichash::State::new(Some(secretbox::KEYBYTES), Some(&key.0))
+        .map_err(|_| hbb_common::anyhow::anyhow!("key derivation failed"))?;
+    for part in [
+        KX_SPLIT_CONTEXT,
+        &[direction],
+        &KX_VERSION.to_le_bytes(),
+        &KX_VERSION.to_le_bytes(),
+        t.0,
+        t.1,
+    ] {
+        h.update(part)
+            .map_err(|_| hbb_common::anyhow::anyhow!("key derivation failed"))?;
+    }
+    let d = h
+        .finalize()
+        .map_err(|_| hbb_common::anyhow::anyhow!("key derivation failed"))?;
+    let mut k = [0u8; secretbox::KEYBYTES];
+    k.copy_from_slice(d.as_ref());
+    Ok(secretbox::Key(k))
+}
 
 #[derive(Clone, Debug)]
 enum Data {
@@ -1243,18 +1277,23 @@ impl RendezvousServer {
             // secure tcp: deadline has elapsed" without it. Clients that do not wait skip it.
             // Our signed ephemeral box key goes out first; the client answers with its own
             // ephemeral key and a sealed secretbox key, and from then on both directions are
-            // sealed under that key (version 0: one key, counters as nonces).
+            // sealed. We advertise version 1 (a key per direction, as the 1.5.1 client derives
+            // them); a client that answers with version 0 gets the original single key.
             let mut dec: Option<Encrypt> = None;
-            let mut kx_sk: Option<box_::SecretKey> = None;
+            let mut kx_sk: Option<(box_::PublicKey, box_::SecretKey)> = None;
             if let Some(sk) = self.inner.sk.as_ref() {
                 let (our_pk_b, our_sk_b) = box_::gen_keypair();
                 let mut msg_out = RendezvousMessage::new();
-                msg_out.set_key_exchange(KeyExchange {
+                let mut ex = KeyExchange {
                     keys: vec![Bytes::from(sign::sign(&our_pk_b.0, sk))],
                     ..Default::default()
-                });
+                };
+                // `version` (field 2) is newer than our hbb_common's proto.
+                ex.mut_unknown_fields()
+                    .add_varint(KX_VERSION_FIELD, KX_VERSION as u64);
+                msg_out.set_key_exchange(ex);
                 Self::send_to_sink(&mut sink, msg_out).await;
-                kx_sk = Some(our_sk_b);
+                kx_sk = Some((our_pk_b, our_sk_b));
             }
             while let Ok(Some(Ok(mut bytes))) = timeout(30_000, b.next()).await {
                 if let Some(d) = dec.as_mut() {
@@ -1262,7 +1301,7 @@ impl RendezvousServer {
                         log::debug!("Tcp from {:?}: {}", addr, err);
                         break;
                     }
-                } else if let Some(our_sk_b) = kx_sk.take() {
+                } else if let Some((our_pk_b, our_sk_b)) = kx_sk.take() {
                     if let Ok(RendezvousMessage {
                         union: Some(rendezvous_message::Union::KeyExchange(ex)),
                         ..
@@ -1272,12 +1311,30 @@ impl RendezvousServer {
                             log::debug!("Tcp from {:?}: bad key exchange", addr);
                             break;
                         }
-                        match Encrypt::decode(&ex.keys[1], &ex.keys[0], &our_sk_b) {
-                            Ok(k) => {
-                                if let Some(Sink::TcpStream(_, enc)) = sink.as_mut() {
-                                    *enc = Some(Encrypt::new(k.clone()));
+                        let picked = match ex.unknown_fields().get(KX_VERSION_FIELD) {
+                            None => 0,
+                            Some(hbb_common::protobuf::UnknownValueRef::Varint(v)) => v,
+                            Some(_) => u64::MAX,
+                        };
+                        let keys = Encrypt::decode(&ex.keys[1], &ex.keys[0], &our_sk_b)
+                            .and_then(|k| match picked {
+                                0 => Ok((k.clone(), k)),
+                                1 => {
+                                    let t = (&ex.keys[0][..], &our_pk_b.0[..]);
+                                    // The client sent the sealed key: it is the initiator.
+                                    Ok((
+                                        kx_subkey(&k, KX_SPLIT_RESPONDER, t)?,
+                                        kx_subkey(&k, KX_SPLIT_INITIATOR, t)?,
+                                    ))
                                 }
-                                dec = Some(Encrypt::new(k));
+                                v => bail!("unsupported key exchange version {}", v),
+                            });
+                        match keys {
+                            Ok((send_key, recv_key)) => {
+                                if let Some(Sink::TcpStream(_, enc)) = sink.as_mut() {
+                                    *enc = Some(Encrypt::new(send_key));
+                                }
+                                dec = Some(Encrypt::new(recv_key));
                                 continue;
                             }
                             Err(err) => {

@@ -18,8 +18,9 @@ This is the ID/rendezvous server of **SKY Support**, the remote-support client o
   server, hbbs sends a `KeyExchange` with an ephemeral box key signed by the server key as the first message
   of every TCP connection on 21116. A client that is signed in to an API server waits for it and otherwise fails
   with "Failed to secure tcp: deadline has elapsed". When the client answers, both directions are sealed with
-  the exchanged key (version 0: one key, counters as nonces); clients that do not answer stay in the clear and
-  skip the message. Same scheme as lejianwen/rustdesk-server.
+  the exchanged key. We advertise version 1 (one key per direction, derived as in the RustDesk 1.5.1 client,
+  `kx_subkey`); a client that answers with version 0 (before 1.5.1) gets the original single key. Clients that
+  do not answer stay in the clear and skip the message.
 - Build: `.github/workflows/sky-build.yml` (hbbs, x86_64 Linux, static musl).
 
 No keys, passwords or addresses of SKY are in this repository.
